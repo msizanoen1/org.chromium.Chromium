@@ -1,0 +1,1012 @@
+diff --git a/gpu/vulkan/BUILD.gn b/gpu/vulkan/BUILD.gn
+index 903873d6139a5..ea55b6f72ab81 100644
+--- a/gpu/vulkan/BUILD.gn
++++ b/gpu/vulkan/BUILD.gn
+@@ -134,6 +134,10 @@ if (enable_vulkan) {
+       if (is_linux || is_chromeos) {
+         sources += [ "vulkan_image_linux.cc" ]
+       }
++
++      if (is_linux) {
++        deps += [ "//third_party/libsync" ]
++      }
+     }
+ 
+     if (is_android) {
+diff --git a/gpu/vulkan/vulkan_util_posix.cc b/gpu/vulkan/vulkan_util_posix.cc
+index 079a69f644ad5..ebac2bec9f88d 100644
+--- a/gpu/vulkan/vulkan_util_posix.cc
++++ b/gpu/vulkan/vulkan_util_posix.cc
+@@ -7,6 +7,10 @@
+ #include "base/logging.h"
+ #include "gpu/vulkan/vulkan_function_pointers.h"
+ 
++#if BUILDFLAG(IS_LINUX)
++#include <sync/sync.h>
++#endif
++
+ namespace gpu {
+ 
+ VkSemaphore ImportVkSemaphoreHandle(VkDevice vk_device,
+@@ -24,6 +28,17 @@ VkSemaphore ImportVkSemaphoreHandle(VkDevice vk_device,
+   if (result != VK_SUCCESS)
+     return VK_NULL_HANDLE;
+   base::ScopedFD fd = handle.TakeHandle();
++#if BUILDFLAG(IS_LINUX)
++  if (handle_type == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT) {
++    auto sync_info =
++        std::unique_ptr<sync_fence_info_data, void (*)(sync_fence_info_data*)>{
++            sync_fence_info(fd.get()), sync_fence_info_free};
++    if (sync_info) {
++      // Ensure that importing a sync_file as an opaque FD works on Linux.
++      handle_type = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
++    }
++  }
++#endif
+   const auto is_sync_fd =
+       handle_type == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+   const VkImportSemaphoreFdInfoKHR import = {
+diff --git a/media/gpu/BUILD.gn b/media/gpu/BUILD.gn
+index 3d80f96415935..4585aca8e5204 100644
+--- a/media/gpu/BUILD.gn
++++ b/media/gpu/BUILD.gn
+@@ -20,7 +20,7 @@ buildflag_header("buildflags") {
+     "USE_VAAPI_IMAGE_CODECS=$use_vaapi_image_codecs",
+     "USE_V4L2_CODEC=$use_v4l2_codec",
+     "USE_LIBV4L2=$use_v4lplugin",
+-    "USE_VAAPI_X11=$use_vaapi_x11",
++    "SUPPORT_VAAPI_OVER_X11=$support_vaapi_over_x11",
+   ]
+ }
+ 
+diff --git a/media/gpu/args.gni b/media/gpu/args.gni
+index 813657af180f2..61790c73df244 100644
+--- a/media/gpu/args.gni
++++ b/media/gpu/args.gni
+@@ -6,10 +6,14 @@ import("//build/config/chromeos/ui_mode.gni")
+ import("//build/config/ozone.gni")
+ 
+ declare_args() {
+-  # Indicates if X11 VA-API-based hardware acceleration is to be used.
+-  # See also the comment near the |use_vaapi| arg.
+-  use_vaapi_x11 = is_linux && ozone_platform_x11 &&
+-                  (target_cpu == "x86" || target_cpu == "x64") && !is_castos
++  # Build Chrome support for using VA-API over X11. Note that setting this to true is
++  # not a guarantee that Chrome will use (or even try to use) VA-API over X11. In
++  # particular, it is possible to build Chrome with support for VA-API over X11 but
++  # pick Wayland as the Ozone backend at runtime. In this case, Chrome will try to
++  # use VA-API over DRM.
++  support_vaapi_over_x11 =
++      is_linux && ozone_platform_x11 &&
++      (target_cpu == "x86" || target_cpu == "x64") && !is_castos
+ }
+ 
+ declare_args() {
+@@ -29,8 +33,9 @@ declare_args() {
+   # is typically the case on x86-based ChromeOS devices.
+   # VA-API should also be compiled by default on x11-using linux devices
+   # using x86/x64.
+-  use_vaapi = use_vaapi_x11 || (is_chromeos_lacros &&
+-                                (target_cpu == "x86" || target_cpu == "x64"))
++  use_vaapi =
++      support_vaapi_over_x11 ||
++      (is_chromeos_lacros && (target_cpu == "x86" || target_cpu == "x64"))
+ 
+   # Indicates if ChromeOS protected media support exists. This is used
+   # to enable the CDM daemon in Chrome OS as well as support for
+diff --git a/media/gpu/vaapi/BUILD.gn b/media/gpu/vaapi/BUILD.gn
+index d549e9a1eefa2..8a489517486f7 100644
+--- a/media/gpu/vaapi/BUILD.gn
++++ b/media/gpu/vaapi/BUILD.gn
+@@ -17,7 +17,7 @@ assert(use_vaapi)
+ generate_stubs("libva_stubs") {
+   extra_header = "va_stub_header.fragment"
+   sigs = [ "va.sigs" ]
+-  if (use_vaapi_x11) {
++  if (support_vaapi_over_x11) {
+     sigs += [ "va_x11.sigs" ]
+   }
+   if (is_chromeos_ash) {
+@@ -138,7 +138,7 @@ source_set("vaapi") {
+     ]
+   }
+ 
+-  if (use_vaapi_x11) {
++  if (support_vaapi_over_x11) {
+     deps += [ "//ui/gfx/x" ]
+     sources += [
+       "vaapi_picture_native_pixmap_angle.cc",
+@@ -212,7 +212,7 @@ source_set("common") {
+     deps += [ "//ui/ozone" ]
+   }
+ 
+-  if (use_vaapi_x11) {
++  if (support_vaapi_over_x11) {
+     deps += [ "//ui/gfx/x" ]
+   }
+ 
+diff --git a/media/gpu/vaapi/va_stub_header.fragment b/media/gpu/vaapi/va_stub_header.fragment
+index e8c46c5e81c36..a7f07c87d76c6 100644
+--- a/media/gpu/vaapi/va_stub_header.fragment
++++ b/media/gpu/vaapi/va_stub_header.fragment
+@@ -7,8 +7,8 @@ extern "C" {
+ 
+ #include <va/va_drm.h>
+ #include <va/va.h>
+-#if BUILDFLAG(USE_VAAPI_X11)
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ #include <va/va_x11.h>
+-#endif  // BUILDFLAG(USE_VAAPI_X11)
++#endif  // BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ 
+ }
+diff --git a/media/gpu/vaapi/vaapi_picture_factory.cc b/media/gpu/vaapi/vaapi_picture_factory.cc
+index 5dadd7cd9a7e4..8efee1e438811 100644
+--- a/media/gpu/vaapi/vaapi_picture_factory.cc
++++ b/media/gpu/vaapi/vaapi_picture_factory.cc
+@@ -13,9 +13,9 @@
+ #if BUILDFLAG(IS_OZONE)
+ #include "media/gpu/vaapi/vaapi_picture_native_pixmap_ozone.h"
+ #endif  // BUILDFLAG(IS_OZONE)
+-#if BUILDFLAG(USE_VAAPI_X11)
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ #include "media/gpu/vaapi/vaapi_picture_native_pixmap_angle.h"
+-#endif  // BUILDFLAG(USE_VAAPI_X11)
++#endif  // BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ #if defined(USE_EGL)
+ #include "media/gpu/vaapi/vaapi_picture_native_pixmap_egl.h"
+ #endif
+@@ -41,19 +41,29 @@ std::unique_ptr<VaapiPicture> CreateVaapiPictureNativeImpl(
+ 
+ }  // namespace
+ 
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++VaapiPictureFactory::VaapiPictureFactory(
++    absl::optional<bool> may_use_vaapi_over_x11)
++    : may_use_vaapi_over_x11_(may_use_vaapi_over_x11) {
++#else
+ VaapiPictureFactory::VaapiPictureFactory() {
++#endif  // BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+   vaapi_impl_pairs_.insert(
+       std::make_pair(gl::kGLImplementationEGLGLES2,
+                      VaapiPictureFactory::kVaapiImplementationDrm));
+-#if BUILDFLAG(USE_VAAPI_X11)
+-  vaapi_impl_pairs_.insert(
+-      std::make_pair(gl::kGLImplementationEGLANGLE,
+-                     VaapiPictureFactory::kVaapiImplementationAngle));
+-#elif BUILDFLAG(IS_OZONE)
++
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++  CHECK(may_use_vaapi_over_x11_.has_value());
++  if (may_use_vaapi_over_x11_.value()) {
++    vaapi_impl_pairs_.insert(
++        std::make_pair(gl::kGLImplementationEGLANGLE,
++                       VaapiPictureFactory::kVaapiImplementationAngle));
++  }
++#else
+   vaapi_impl_pairs_.insert(
+       std::make_pair(gl::kGLImplementationEGLANGLE,
+                      VaapiPictureFactory::kVaapiImplementationDrm));
+-#endif
++#endif  // BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ 
+   DeterminePictureCreationAndDownloadingMechanism();
+ }
+@@ -93,19 +103,19 @@ VaapiPictureFactory::GetVaapiImplementation(gl::GLImplementation gl_impl) {
+ }
+ 
+ uint32_t VaapiPictureFactory::GetGLTextureTarget() {
+-#if BUILDFLAG(USE_VAAPI_X11)
+-  return GL_TEXTURE_2D;
+-#else
++#if BUILDFLAG(IS_CHROMEOS)
+   return GL_TEXTURE_EXTERNAL_OES;
+-#endif
++#else
++  return GL_TEXTURE_2D;
++#endif  // BUILDFLAG(IS_CHROMEOS)
+ }
+ 
+ gfx::BufferFormat VaapiPictureFactory::GetBufferFormat() {
+-#if BUILDFLAG(USE_VAAPI_X11)
+-  return gfx::BufferFormat::RGBX_8888;
+-#else
++#if BUILDFLAG(IS_CHROMEOS)
+   return gfx::BufferFormat::YUV_420_BIPLANAR;
+-#endif
++#else
++  return gfx::BufferFormat::RGBX_8888;
++#endif  // BUILDFLAG(IS_CHROMEOS)
+ }
+ 
+ void VaapiPictureFactory::DeterminePictureCreationAndDownloadingMechanism() {
+@@ -113,19 +123,23 @@ void VaapiPictureFactory::DeterminePictureCreationAndDownloadingMechanism() {
+ #if BUILDFLAG(IS_OZONE)
+     // We can be called without GL initialized, which is valid if we use Ozone.
+     case kVaapiImplementationNone:
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++      DCHECK(may_use_vaapi_over_x11_.value_or(false));
++#endif
+       create_picture_cb_ = base::BindRepeating(
+           &CreateVaapiPictureNativeImpl<VaapiPictureNativePixmapOzone>);
+       needs_vpp_for_downloading_ = true;
+       break;
+ #endif  // BUILDFLAG(IS_OZONE)
+-#if BUILDFLAG(USE_VAAPI_X11)
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+     case kVaapiImplementationAngle:
++      DCHECK(may_use_vaapi_over_x11_.value_or(false));
+       create_picture_cb_ = base::BindRepeating(
+           &CreateVaapiPictureNativeImpl<VaapiPictureNativePixmapAngle>);
+       // Neither VaapiTFPPicture or VaapiPictureNativePixmapAngle needs the VPP.
+       needs_vpp_for_downloading_ = false;
+       break;
+-#endif  // BUILDFLAG(USE_VAAPI_X11)
++#endif  // BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+     case kVaapiImplementationDrm:
+ #if BUILDFLAG(IS_OZONE)
+       create_picture_cb_ = base::BindRepeating(
+diff --git a/media/gpu/vaapi/vaapi_picture_factory.h b/media/gpu/vaapi/vaapi_picture_factory.h
+index 213c0308541e6..347986f59ae11 100644
+--- a/media/gpu/vaapi/vaapi_picture_factory.h
++++ b/media/gpu/vaapi/vaapi_picture_factory.h
+@@ -35,7 +35,11 @@ class MEDIA_GPU_EXPORT VaapiPictureFactory {
+     kVaapiImplementationAngle,
+   };
+ 
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++  explicit VaapiPictureFactory(absl::optional<bool> may_use_vaapi_over_x11);
++#else
+   VaapiPictureFactory();
++#endif  // BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ 
+   VaapiPictureFactory(const VaapiPictureFactory&) = delete;
+   VaapiPictureFactory& operator=(const VaapiPictureFactory&) = delete;
+@@ -84,6 +88,11 @@ class MEDIA_GPU_EXPORT VaapiPictureFactory {
+ 
+   CreatePictureCB create_picture_cb_;
+   bool needs_vpp_for_downloading_ = false;
++
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++  // See comment in `VaapiWrapper::MayUseVaapiOverX11()`.
++  absl::optional<bool> may_use_vaapi_over_x11_;
++#endif  // BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ };
+ 
+ }  // namespace media
+diff --git a/media/gpu/vaapi/vaapi_picture_native_pixmap_ozone.cc b/media/gpu/vaapi/vaapi_picture_native_pixmap_ozone.cc
+index 2abb6886660b0..ae4a02daa187b 100644
+--- a/media/gpu/vaapi/vaapi_picture_native_pixmap_ozone.cc
++++ b/media/gpu/vaapi/vaapi_picture_native_pixmap_ozone.cc
+@@ -116,7 +116,7 @@ VaapiStatus VaapiPictureNativePixmapOzone::Allocate(gfx::BufferFormat format) {
+   ui::OzonePlatform* platform = ui::OzonePlatform::GetInstance();
+   ui::SurfaceFactoryOzone* factory = platform->GetSurfaceFactoryOzone();
+   gfx::BufferUsage buffer_usage = gfx::BufferUsage::SCANOUT_VDA_WRITE;
+-#if BUILDFLAG(USE_VAAPI_X11)
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+   // The 'VaapiVideoDecodeAccelerator' requires the VPP to download the decoded
+   // frame from the internal surface to the allocated native pixmap.
+   // 'SCANOUT_VDA_WRITE' is used for 'YUV_420_BIPLANAR' on ChromeOS; For Linux,
+diff --git a/media/gpu/vaapi/vaapi_video_decode_accelerator.cc b/media/gpu/vaapi/vaapi_video_decode_accelerator.cc
+index 4e3a55f9862bc..173605ee624ab 100644
+--- a/media/gpu/vaapi/vaapi_video_decode_accelerator.cc
++++ b/media/gpu/vaapi/vaapi_video_decode_accelerator.cc
+@@ -182,7 +182,12 @@ bool VaapiVideoDecodeAccelerator::Initialize(const Config& config,
+                                              Client* client) {
+   DCHECK(task_runner_->BelongsToCurrentThread());
+ 
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++  vaapi_picture_factory_ =
++      std::make_unique<VaapiPictureFactory>(VaapiWrapper::MayUseVaapiOverX11());
++#else
+   vaapi_picture_factory_ = std::make_unique<VaapiPictureFactory>();
++#endif  // BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ 
+   if (config.is_encrypted()) {
+     NOTREACHED() << "Encrypted streams are not supported for this VDA";
+@@ -1208,7 +1213,7 @@ VaapiVideoDecodeAccelerator::GetSupportedProfiles() {
+ 
+ VaapiVideoDecodeAccelerator::BufferAllocationMode
+ VaapiVideoDecodeAccelerator::DecideBufferAllocationMode() {
+-#if BUILDFLAG(USE_VAAPI_X11)
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+   // The IMPORT mode is used for Android on Chrome OS, so this doesn't apply
+   // here.
+   DCHECK_NE(output_mode_, VideoDecodeAccelerator::Config::OutputMode::IMPORT);
+diff --git a/media/gpu/vaapi/vaapi_video_decode_accelerator_unittest.cc b/media/gpu/vaapi/vaapi_video_decode_accelerator_unittest.cc
+index 976daf1873d47..ad3f783eaba72 100644
+--- a/media/gpu/vaapi/vaapi_video_decode_accelerator_unittest.cc
++++ b/media/gpu/vaapi/vaapi_video_decode_accelerator_unittest.cc
+@@ -41,6 +41,11 @@ struct TestParams {
+   bool decode_using_client_picture_buffers;
+ };
+ 
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++// TODO: Add it in TestParams to cover Ozone/Wayland.
++bool kMayUseVaapiOverX11 = true;
++#endif  // BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++
+ constexpr int32_t kBitstreamId = 123;
+ constexpr size_t kInputSize = 256;
+ 
+@@ -134,7 +139,13 @@ class MockVaapiPicture : public VaapiPicture {
+ 
+ class MockVaapiPictureFactory : public VaapiPictureFactory {
+  public:
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++  explicit MockVaapiPictureFactory(absl::optional<bool> may_use_vaapi_over_x11)
++      : VaapiPictureFactory(may_use_vaapi_over_x11) {}
++#else
+   MockVaapiPictureFactory() = default;
++#endif  // BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++
+   ~MockVaapiPictureFactory() override = default;
+ 
+   MOCK_METHOD3(MockCreateVaapiPicture,
+@@ -167,7 +178,12 @@ class VaapiVideoDecodeAcceleratorTest : public TestWithParam<TestParams>,
+                     const scoped_refptr<gl::GLImage>& image) { return true; })),
+         decoder_thread_("VaapiVideoDecodeAcceleratorTestThread"),
+         mock_decoder_(new ::testing::StrictMock<MockAcceleratedVideoDecoder>),
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++        mock_vaapi_picture_factory_(
++            new MockVaapiPictureFactory(kMayUseVaapiOverX11)),
++#else
+         mock_vaapi_picture_factory_(new MockVaapiPictureFactory()),
++#endif  // BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+         mock_vaapi_wrapper_(new MockVaapiWrapper(VaapiWrapper::kDecode)),
+         mock_vpp_vaapi_wrapper_(new MockVaapiWrapper(VaapiWrapper::kDecode)),
+         weak_ptr_factory_(this) {
+@@ -422,11 +438,13 @@ TEST_P(VaapiVideoDecodeAcceleratorTest, SupportedPlatforms) {
+             mock_vaapi_picture_factory_->GetVaapiImplementation(
+                 gl::kGLImplementationEGLGLES2));
+ 
+-#if BUILDFLAG(USE_VAAPI_X11)
+-  EXPECT_EQ(VaapiPictureFactory::kVaapiImplementationAngle,
+-            mock_vaapi_picture_factory_->GetVaapiImplementation(
+-                gl::kGLImplementationEGLANGLE));
+-#elif BUILDFLAG(IS_OZONE)
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++  if (kMayUseVaapiOverX11) {
++    EXPECT_EQ(VaapiPictureFactory::kVaapiImplementationAngle,
++              mock_vaapi_picture_factory_->GetVaapiImplementation(
++                  gl::kGLImplementationEGLANGLE));
++  }
++#else
+   EXPECT_EQ(VaapiPictureFactory::kVaapiImplementationDrm,
+             mock_vaapi_picture_factory_->GetVaapiImplementation(
+                 gl::kGLImplementationEGLANGLE));
+diff --git a/media/gpu/vaapi/vaapi_wrapper.cc b/media/gpu/vaapi/vaapi_wrapper.cc
+index 77e0216a607b2..1668010fac588 100644
+--- a/media/gpu/vaapi/vaapi_wrapper.cc
++++ b/media/gpu/vaapi/vaapi_wrapper.cc
+@@ -62,7 +62,7 @@
+ #include "ui/gl/gl_bindings.h"
+ #include "ui/gl/gl_implementation.h"
+ 
+-#if BUILDFLAG(USE_VAAPI_X11)
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ typedef XID Drawable;
+ 
+ extern "C" {
+@@ -70,7 +70,7 @@ extern "C" {
+ }
+ 
+ #include "ui/gfx/x/connection.h"  // nogncheck
+-#endif                            // BUILDFLAG(USE_VAAPI_X11)
++#endif                            // BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ 
+ #if BUILDFLAG(IS_OZONE)
+ #include "ui/ozone/public/ozone_platform.h"
+@@ -84,14 +84,14 @@ using media_gpu_vaapi::kModuleVa_prot;
+ 
+ using media_gpu_vaapi::kModuleVa;
+ using media_gpu_vaapi::kModuleVa_drm;
+-#if BUILDFLAG(USE_VAAPI_X11)
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ using media_gpu_vaapi::kModuleVa_x11;
+-#endif  // BUILDFLAG(USE_VAAPI_X11)
++#endif  // BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ using media_gpu_vaapi::InitializeStubs;
+ using media_gpu_vaapi::IsVaInitialized;
+-#if BUILDFLAG(USE_VAAPI_X11)
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ using media_gpu_vaapi::IsVa_x11Initialized;
+-#endif  // BUILDFLAG(USE_VAAPI_X11)
++#endif  // BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ using media_gpu_vaapi::IsVa_drmInitialized;
+ using media_gpu_vaapi::StubPathMap;
+ 
+@@ -680,6 +680,12 @@ class VADisplayState {
+ 
+   void SetDrmFd(base::PlatformFile fd) { drm_fd_.reset(HANDLE_EINTR(dup(fd))); }
+ 
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++  absl::optional<bool> MayUseVaapiOverX11() const {
++    return may_use_vaapi_over_x11_;
++  }
++#endif
++
+  private:
+   friend class base::NoDestructor<VADisplayState>;
+ 
+@@ -702,6 +708,13 @@ class VADisplayState {
+   // Drm fd used to obtain access to the driver interface by VA.
+   base::ScopedFD drm_fd_;
+ 
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++  // Whether we'll be possibly using VA-API over Ozone/X11. This should only be
++  // set (if at all) during the pre-sandbox initialization. If absl::nullopt,
++  // all calls to Initialize() will return false immediately.
++  absl::optional<bool> may_use_vaapi_over_x11_;
++#endif
++
+   // The VADisplay handle. Valid between Initialize() and Deinitialize().
+   VADisplay va_display_;
+ 
+@@ -723,6 +736,15 @@ VADisplayState* VADisplayState::Get() {
+ 
+ // static
+ void VADisplayState::PreSandboxInitialization() {
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++  if (ui::OzonePlatform::IsInitialized()) {
++    VADisplayState::Get()->may_use_vaapi_over_x11_ =
++        ui::OzonePlatform::GetInstance()
++            ->GetPlatformProperties()
++            .supports_vaapi_x11;
++  }
++#endif
++
+   constexpr char kRenderNodeFilePattern[] = "/dev/dri/renderD%d";
+   // This loop ends on either the first card that does not exist or the first
+   // render node that is not vgem.
+@@ -755,20 +777,18 @@ VADisplayState::VADisplayState()
+ bool VADisplayState::Initialize() {
+   base::AutoLock auto_lock(va_lock_);
+ 
+-#if BUILDFLAG(IS_OZONE) && BUILDFLAG(IS_LINUX)
+-  // TODO(crbug.com/1116701): add vaapi support for other Ozone platforms on
+-  // Linux. See comment in OzonePlatform::PlatformProperties::supports_vaapi
+-  // for more details. This will also require revisiting everything that's
+-  // guarded by USE_VAAPI_X11. For example, if USE_VAAPI_X11 is true, but the
+-  // user chooses the Wayland backend for Ozone at runtime, then many things (if
+-  // not all) that we do for X11 won't apply.
+-  if (!ui::OzonePlatform::GetInstance()->GetPlatformProperties().supports_vaapi)
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++  if (!may_use_vaapi_over_x11_.has_value())
+     return false;
+ #endif
+ 
+   bool libraries_initialized = IsVaInitialized() && IsVa_drmInitialized();
+-#if BUILDFLAG(USE_VAAPI_X11)
+-  libraries_initialized = libraries_initialized && IsVa_x11Initialized();
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++  // Initialize VA-API X11 display backend for Linux Ozone/X11.
++  // See comment in OzonePlatform::PlatformProperties::supports_vaapi_x11 for
++  // more details.
++  if (may_use_vaapi_over_x11_.value())
++    libraries_initialized = libraries_initialized && IsVa_x11Initialized();
+ #endif
+   if (!libraries_initialized)
+     return false;
+@@ -783,7 +803,7 @@ bool VADisplayState::Initialize() {
+   return success;
+ }
+ 
+-#if BUILDFLAG(USE_VAAPI_X11)
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ 
+ absl::optional<VADisplay> GetVADisplayStateX11(const base::ScopedFD& drm_fd) {
+   switch (gl::GetGLImplementation()) {
+@@ -809,13 +829,19 @@ absl::optional<VADisplay> GetVADisplayStateX11(const base::ScopedFD& drm_fd) {
+   }
+ }
+ 
+-#else
++#endif  // BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ 
+ absl::optional<VADisplay> GetVADisplayState(const base::ScopedFD& drm_fd) {
+   switch (gl::GetGLImplementation()) {
+     case gl::kGLImplementationEGLGLES2:
++#if BUILDFLAG(IS_CHROMEOS)
++    // GetVADisplayState() should not get called on Linux with Ozone/X11
++    // (GetVADisplayStateX11() should get called instead), and we haven't tried
++    // VA-API decoding on Linux with Ozone/Wayland and anything other than
++    // native EGL/GLES2.
+     case gl::kGLImplementationEGLANGLE:
+     case gl::kGLImplementationNone:
++#endif
+       return vaGetDisplayDRM(drm_fd.get());
+     default:
+       LOG(WARNING) << "VAAPI video acceleration not available for "
+@@ -825,18 +851,23 @@ absl::optional<VADisplay> GetVADisplayState(const base::ScopedFD& drm_fd) {
+   }
+ }
+ 
+-#endif  // BUILDFLAG(USE_VAAPI_X11)
+-
+ bool VADisplayState::InitializeVaDisplay_Locked() {
+-  absl::optional<VADisplay> display =
+-#if BUILDFLAG(USE_VAAPI_X11)
+-      GetVADisplayStateX11(drm_fd_);
+-#else
+-      GetVADisplayState(drm_fd_);
+-#endif
++  absl::optional<VADisplay> display;
+ 
+-  if (!display)
+-    return false;
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++  DCHECK(may_use_vaapi_over_x11_.has_value());
++  if (may_use_vaapi_over_x11_.value()) {
++    display = GetVADisplayStateX11(drm_fd_);
++    if (!display)
++      return false;
++  }
++#endif  // BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++
++  if (!display) {
++    display = GetVADisplayState(drm_fd_);
++    if (!display)
++      return false;
++  }
+ 
+   va_display_ = *display;
+   if (!vaDisplayIsValid(va_display_)) {
+@@ -1671,6 +1702,13 @@ scoped_refptr<VaapiWrapper> VaapiWrapper::CreateForVideoCodec(
+                 enforce_sequence_affinity);
+ }
+ 
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++// static
++absl::optional<bool> VaapiWrapper::MayUseVaapiOverX11() {
++  return VADisplayState::Get()->MayUseVaapiOverX11();
++}
++#endif
++
+ // static
+ std::vector<SVCScalabilityMode> VaapiWrapper::GetSupportedScalabilityModes(
+     VideoCodecProfile media_profile,
+@@ -2680,12 +2718,13 @@ bool VaapiWrapper::MapAndCopyAndExecute(
+   return Execute_Locked(va_surface_id, va_buffer_ids);
+ }
+ 
+-#if BUILDFLAG(USE_VAAPI_X11)
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ bool VaapiWrapper::PutSurfaceIntoPixmap(VASurfaceID va_surface_id,
+                                         x11::Pixmap x_pixmap,
+                                         gfx::Size dest_size) {
+   CHECK(!enforce_sequence_affinity_ ||
+         sequence_checker_.CalledOnValidSequence());
++  CHECK(MayUseVaapiOverX11().value_or(false));
+   base::AutoLockMaybe auto_lock(va_lock_.get());
+ 
+   VAStatus va_res = vaSyncSurface(va_display_, va_surface_id);
+@@ -2699,7 +2738,7 @@ bool VaapiWrapper::PutSurfaceIntoPixmap(VASurfaceID va_surface_id,
+   VA_SUCCESS_OR_RETURN(va_res, VaapiFunctions::kVAPutSurface, false);
+   return true;
+ }
+-#endif  // BUILDFLAG(USE_VAAPI_X11)
++#endif  // BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ 
+ std::unique_ptr<ScopedVAImage> VaapiWrapper::CreateVaImage(
+     VASurfaceID va_surface_id,
+@@ -3101,7 +3140,7 @@ void VaapiWrapper::PreSandboxInitialization() {
+ 
+   paths[kModuleVa].push_back(std::string("libva.so.") + va_suffix);
+   paths[kModuleVa_drm].push_back(std::string("libva-drm.so.") + va_suffix);
+-#if BUILDFLAG(USE_VAAPI_X11)
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+   paths[kModuleVa_x11].push_back(std::string("libva-x11.so.") + va_suffix);
+ #endif
+ #if BUILDFLAG(IS_CHROMEOS_ASH)
+diff --git a/media/gpu/vaapi/vaapi_wrapper.h b/media/gpu/vaapi/vaapi_wrapper.h
+index 1236a3f766b98..e307007ea0cd1 100644
+--- a/media/gpu/vaapi/vaapi_wrapper.h
++++ b/media/gpu/vaapi/vaapi_wrapper.h
+@@ -36,9 +36,9 @@
+ #include "third_party/abseil-cpp/absl/types/optional.h"
+ #include "ui/gfx/geometry/size.h"
+ 
+-#if BUILDFLAG(USE_VAAPI_X11)
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ #include "ui/gfx/x/xproto.h"  // nogncheck
+-#endif                        // BUILDFLAG(USE_VAAPI_X11)
++#endif                        // BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ 
+ namespace gfx {
+ enum class BufferFormat;
+@@ -186,6 +186,16 @@ class MEDIA_GPU_EXPORT VaapiWrapper
+   VaapiWrapper(const VaapiWrapper&) = delete;
+   VaapiWrapper& operator=(const VaapiWrapper&) = delete;
+ 
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
++  // Returns true if VaapiWrapper instances may use VA-API over X11 and false
++  // otherwise (VA-API over DRM will be used). If this returns absl::nullopt,
++  // it's because it was not possible to determine how VA-API may be used. This
++  // should only be called after PreSandboxInitialization() (which is assumed to
++  // be called only once during the GPU process startup) and is safe to call
++  // from any thread. Additionally, this should always return the same value.
++  static absl::optional<bool> MayUseVaapiOverX11();
++#endif
++
+   // Returns the supported SVC scalability modes for specified profile.
+   static std::vector<SVCScalabilityMode> GetSupportedScalabilityModes(
+       VideoCodecProfile media_profile,
+@@ -439,13 +449,13 @@ class MEDIA_GPU_EXPORT VaapiWrapper
+       VASurfaceID va_surface_id,
+       const std::vector<std::pair<VABufferID, VABufferDescriptor>>& va_buffers);
+ 
+-#if BUILDFLAG(USE_VAAPI_X11)
++#if BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+   // Put data from |va_surface_id| into |x_pixmap| of size
+   // |dest_size|, converting/scaling to it.
+   [[nodiscard]] bool PutSurfaceIntoPixmap(VASurfaceID va_surface_id,
+                                           x11::Pixmap x_pixmap,
+                                           gfx::Size dest_size);
+-#endif  // BUILDFLAG(USE_VAAPI_X11)
++#endif  // BUILDFLAG(SUPPORT_VAAPI_OVER_X11)
+ 
+   // Creates a ScopedVAImage from a VASurface |va_surface_id| and map it into
+   // memory with the given |format| and |size|. If |format| is not equal to the
+diff --git a/ui/ozone/platform/wayland/gpu/vulkan_implementation_wayland.cc b/ui/ozone/platform/wayland/gpu/vulkan_implementation_wayland.cc
+index 60c84d3f2166e..240eb9bbac436 100644
+--- a/ui/ozone/platform/wayland/gpu/vulkan_implementation_wayland.cc
++++ b/ui/ozone/platform/wayland/gpu/vulkan_implementation_wayland.cc
+@@ -101,7 +101,7 @@ VulkanImplementationWayland::ExportVkFenceToGpuFence(VkDevice vk_device,
+ VkSemaphore VulkanImplementationWayland::CreateExternalSemaphore(
+     VkDevice vk_device) {
+   return gpu::CreateExternalVkSemaphore(
+-      vk_device, VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT);
++      vk_device, VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
+ }
+ 
+ VkSemaphore VulkanImplementationWayland::ImportSemaphoreHandle(
+@@ -114,7 +114,7 @@ gpu::SemaphoreHandle VulkanImplementationWayland::GetSemaphoreHandle(
+     VkDevice vk_device,
+     VkSemaphore vk_semaphore) {
+   return gpu::GetVkSemaphoreHandle(
+-      vk_device, vk_semaphore, VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT);
++      vk_device, vk_semaphore, VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
+ }
+ 
+ VkExternalMemoryHandleTypeFlagBits
+diff --git a/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc b/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc
+index c192a839204c9..9bf1dce2badb8 100644
+--- a/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc
++++ b/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc
+@@ -199,14 +199,10 @@ WaylandSurfaceFactory::GetAllowedGLImplementations() {
+     // be requested, which is not supported with this backend yet.
+     impls.emplace_back(
+         gl::GLImplementationParts(gl::ANGLEImplementation::kSwiftShader));
+-#if BUILDFLAG(IS_CHROMEOS_LACROS)
+-    // TODO(crbug.com/1231934): --use-angle=gl results in gles, resolve that and
+-    // use the correct config/testsuite on Lacros-like Linux bots.
+     impls.emplace_back(
+         gl::GLImplementationParts(gl::ANGLEImplementation::kOpenGL));
+     impls.emplace_back(
+         gl::GLImplementationParts(gl::ANGLEImplementation::kOpenGLES));
+-#endif  // BUILDFLAG(IS_CHROMEOS_LACROS)
+   }
+   return impls;
+ }
+diff --git a/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.cc b/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.cc
+index 35a214046874f..9e12e795e5393 100644
+--- a/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.cc
++++ b/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.cc
+@@ -4,12 +4,18 @@
+ 
+ #include "ui/ozone/platform/wayland/host/wayland_buffer_manager_host.h"
+ 
++#include <linux/version.h>
++#include <sys/ioctl.h>
++#include <sys/utsname.h>
++#include <unistd.h>
++
+ #include <presentation-time-client-protocol.h>
+ #include <memory>
+ #include <utility>
+ 
+ #include "base/bind.h"
+ #include "base/i18n/number_formatting.h"
++#include "base/posix/eintr_wrapper.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/current_thread.h"
+@@ -27,6 +33,32 @@
+ #include "ui/ozone/platform/wayland/host/wayland_connection.h"
+ #include "ui/ozone/platform/wayland/host/wayland_window.h"
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
++#include <linux/dma-buf.h>
++#else
++#include <linux/types.h>
++
++struct dma_buf_export_sync_file {
++  __u32 flags;
++  __s32 fd;
++};
++
++struct dma_buf_import_sync_file {
++  __u32 flags;
++  __s32 fd;
++};
++
++#define DMA_BUF_SYNC_READ (1 << 0)
++#define DMA_BUF_SYNC_WRITE (2 << 0)
++#define DMA_BUF_SYNC_RW (DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE)
++
++#define DMA_BUF_BASE 'b'
++#define DMA_BUF_IOCTL_EXPORT_SYNC_FILE \
++  _IOWR(DMA_BUF_BASE, 2, struct dma_buf_export_sync_file)
++#define DMA_BUF_IOCTL_IMPORT_SYNC_FILE \
++  _IOW(DMA_BUF_BASE, 3, struct dma_buf_import_sync_file)
++#endif
++
+ namespace ui {
+ 
+ namespace {
+@@ -35,6 +67,39 @@ std::string NumberToString(uint32_t number) {
+   return base::UTF16ToUTF8(base::FormatNumber(number));
+ }
+ 
++void KernelVersionNumbers(int32_t* major_version,
++                          int32_t* minor_version,
++                          int32_t* bugfix_version) {
++  struct utsname info;
++  if (uname(&info) < 0) {
++    NOTREACHED();
++    *major_version = 0;
++    *minor_version = 0;
++    *bugfix_version = 0;
++    return;
++  }
++  int num_read = sscanf(info.release, "%d.%d.%d", major_version, minor_version,
++                        bugfix_version);
++  if (num_read < 1) {
++    *major_version = 0;
++  }
++  if (num_read < 2) {
++    *minor_version = 0;
++  }
++  if (num_read < 3) {
++    *bugfix_version = 0;
++  }
++}
++
++bool CheckImportExportFence() {
++  int32_t major_version, minor_version, bugfix_version;
++
++  KernelVersionNumbers(&major_version, &minor_version, &bugfix_version);
++
++  // DMA_BUF_IOCTL_{IMPORT,EXPORT}_SYNC_FILE was added in 6.0
++  return major_version >= 6;
++}
++
+ }  // namespace
+ 
+ WaylandBufferManagerHost::WaylandBufferManagerHost(
+@@ -87,7 +152,8 @@ bool WaylandBufferManagerHost::SupportsDmabuf() const {
+ }
+ 
+ bool WaylandBufferManagerHost::SupportsAcquireFence() const {
+-  return !!connection_->linux_explicit_synchronization_v1();
++  return !!connection_->linux_explicit_synchronization_v1() ||
++         connection_->UseImplicitSyncInterop();
+ }
+ 
+ bool WaylandBufferManagerHost::SupportsViewporter() const {
+@@ -125,6 +191,7 @@ void WaylandBufferManagerHost::CreateDmabufBasedBuffer(
+                "Format", format, "Buffer id", buffer_id);
+ 
+   base::ScopedFD fd = dmabuf_fd.TakeFD();
++  base::ScopedFD dup_fd(HANDLE_EINTR(dup(fd.get())));
+ 
+   // Validate data and ask surface to create a buffer associated with the
+   // |buffer_id|.
+@@ -141,6 +208,8 @@ void WaylandBufferManagerHost::CreateDmabufBasedBuffer(
+                      std::move(offsets), std::move(modifiers), format,
+                      planes_count, buffer_id));
+ 
++  dma_buffers_.emplace(buffer_id, std::move(dup_fd));
++
+   if (!result.second) {
+     error_message_ = base::StrCat(
+         {"A buffer with id= ", NumberToString(buffer_id), " already exists"});
+@@ -301,6 +370,7 @@ void WaylandBufferManagerHost::DestroyBuffer(uint32_t buffer_id) {
+   }
+ 
+   buffer_backings_.erase(buffer_id);
++  dma_buffers_.erase(buffer_id);
+ }
+ 
+ bool WaylandBufferManagerHost::ValidateDataFromGpu(
+@@ -427,6 +497,49 @@ void WaylandBufferManagerHost::OnPresentation(
+   buffer_manager_gpu_associated_->OnPresentation(widget, frame_id, feedback);
+ }
+ 
++void WaylandBufferManagerHost::InsertAcquireFence(
++    uint32_t buffer_id,
++    const base::ScopedFD& sync_file) {
++  DCHECK(sync_file.is_valid());
++  auto it = dma_buffers_.find(buffer_id);
++  if (it == dma_buffers_.end()) {
++    return;
++  }
++
++  struct dma_buf_import_sync_file req;
++  req.flags = DMA_BUF_SYNC_RW;
++  req.fd = sync_file.get();
++
++  int rv = HANDLE_EINTR(
++      ioctl(it->second.get(), DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &req));
++  PLOG_IF(ERROR, rv) << "Failed DMA_BUF_IOCTL_IMPORT_SYNC_FILE";
++}
++
++base::ScopedFD WaylandBufferManagerHost::ExtractReleaseFence(
++    uint32_t buffer_id) {
++  auto it = dma_buffers_.find(buffer_id);
++  if (it == dma_buffers_.end()) {
++    return base::ScopedFD();
++  }
++
++  struct dma_buf_export_sync_file req;
++  req.flags = DMA_BUF_SYNC_RW;
++
++  if (HANDLE_EINTR(
++          ioctl(it->second.get(), DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &req)) < 0) {
++    return base::ScopedFD();
++  }
++
++  return base::ScopedFD(req.fd);
++}
++
++// static
++bool WaylandBufferManagerHost::SupportsImplicitSyncInterop() {
++  static const bool can_import_export_sync_file = CheckImportExportFence();
++
++  return can_import_export_sync_file;
++}
++
+ void WaylandBufferManagerHost::TerminateGpuProcess() {
+   DCHECK(!error_message_.empty());
+   std::move(terminate_gpu_cb_).Run(std::move(error_message_));
+diff --git a/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.h b/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.h
+index 5368a320f5bb8..e745d6d6b2fda 100644
+--- a/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.h
++++ b/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.h
+@@ -141,6 +141,12 @@ class WaylandBufferManagerHost : public ozone::mojom::WaylandBufferManagerHost {
+                       uint32_t frame_id,
+                       const gfx::PresentationFeedback& feedback);
+ 
++  void InsertAcquireFence(uint32_t buffer_id, const base::ScopedFD& sync_file);
++
++  base::ScopedFD ExtractReleaseFence(uint32_t buffer_id);
++
++  static bool SupportsImplicitSyncInterop();
++
+  private:
+   // Validates data sent from GPU. If invalid, returns false and sets an error
+   // message to |error_message_|.
+@@ -180,6 +186,8 @@ class WaylandBufferManagerHost : public ozone::mojom::WaylandBufferManagerHost {
+   // Maps buffer_id's to corresponding WaylandBufferBacking objects.
+   base::flat_map<uint32_t, std::unique_ptr<WaylandBufferBacking>>
+       buffer_backings_;
++
++  base::flat_map<uint32_t, base::ScopedFD> dma_buffers_;
+ };
+ 
+ }  // namespace ui
+diff --git a/ui/ozone/platform/wayland/host/wayland_connection.h b/ui/ozone/platform/wayland/host/wayland_connection.h
+index 6a4a866bb7cbe..f09a1da2dc673 100644
+--- a/ui/ozone/platform/wayland/host/wayland_connection.h
++++ b/ui/ozone/platform/wayland/host/wayland_connection.h
+@@ -18,6 +18,7 @@
+ #include "ui/display/tablet_state.h"
+ #include "ui/events/event.h"
+ #include "ui/ozone/platform/wayland/common/wayland_object.h"
++#include "ui/ozone/platform/wayland/host/wayland_buffer_manager_host.h"
+ #include "ui/ozone/platform/wayland/host/wayland_clipboard.h"
+ #include "ui/ozone/platform/wayland/host/wayland_data_drag_controller.h"
+ #include "ui/ozone/platform/wayland/host/wayland_data_source.h"
+@@ -302,6 +303,11 @@ class WaylandConnection {
+   const gfx::PointF MaybeConvertLocation(const gfx::PointF& location,
+                                          const WaylandWindow* window) const;
+ 
++  bool UseImplicitSyncInterop() const {
++    return !linux_explicit_synchronization_v1() &&
++           WaylandBufferManagerHost::SupportsImplicitSyncInterop();
++  }
++
+  private:
+   friend class WaylandConnectionTestApi;
+ 
+diff --git a/ui/ozone/platform/wayland/host/wayland_frame_manager.cc b/ui/ozone/platform/wayland/host/wayland_frame_manager.cc
+index c8b28ccb32216..a07e7aed15114 100644
+--- a/ui/ozone/platform/wayland/host/wayland_frame_manager.cc
++++ b/ui/ozone/platform/wayland/host/wayland_frame_manager.cc
+@@ -614,6 +614,22 @@ void WaylandFrameManager::OnWlBufferRelease(WaylandSurface* surface,
+     auto result = frame->submitted_buffers.find(surface);
+     if (result != frame->submitted_buffers.end() &&
+         result->second->wl_buffer() == wl_buffer) {
++      if (connection_->UseImplicitSyncInterop()) {
++        base::ScopedFD fence =
++            connection_->buffer_manager_host()->ExtractReleaseFence(
++                result->second->id());
++
++        if (fence.is_valid()) {
++          if (frame->merged_release_fence_fd.is_valid()) {
++            frame->merged_release_fence_fd.reset(sync_merge(
++                "", frame->merged_release_fence_fd.get(), fence.get()));
++          } else {
++            frame->merged_release_fence_fd = std::move(fence);
++          }
++          DCHECK(frame->merged_release_fence_fd.is_valid());
++        }
++      }
++
+       frame->submitted_buffers.erase(result);
+       break;
+     }
+diff --git a/ui/ozone/platform/wayland/host/wayland_surface.cc b/ui/ozone/platform/wayland/host/wayland_surface.cc
+index 93f690cb09242..eceaf768f6095 100644
+--- a/ui/ozone/platform/wayland/host/wayland_surface.cc
++++ b/ui/ozone/platform/wayland/host/wayland_surface.cc
+@@ -227,7 +227,8 @@ void WaylandSurface::set_acquire_fence(gfx::GpuFenceHandle acquire_fence) {
+   // WaylandBufferManagerGPU knows if the synchronization is not available and
+   // must disallow clients to use explicit synchronization.
+   DCHECK(!apply_state_immediately_);
+-  DCHECK(connection_->linux_explicit_synchronization_v1());
++  DCHECK(connection_->linux_explicit_synchronization_v1() ||
++         connection_->UseImplicitSyncInterop());
+   if (!acquire_fence.is_null()) {
+     base::TimeTicks ticks;
+     auto status = gfx::GpuFence::GetStatusChangeTime(
+@@ -433,6 +434,11 @@ void WaylandSurface::ApplyPendingState() {
+                   pending_state_.buffer,
+                   std::move(next_explicit_release_request_)));
+         }
++      } else if (connection_->UseImplicitSyncInterop()) {
++        if (!pending_state_.acquire_fence.is_null()) {
++          connection_->buffer_manager_host()->InsertAcquireFence(
++              pending_state_.buffer_id, pending_state_.acquire_fence.owned_fd);
++        }
+       }
+     }
+   }
+diff --git a/ui/ozone/platform/x11/ozone_platform_x11.cc b/ui/ozone/platform/x11/ozone_platform_x11.cc
+index 7e93d25f653a3..2843784d27738 100644
+--- a/ui/ozone/platform/x11/ozone_platform_x11.cc
++++ b/ui/ozone/platform/x11/ozone_platform_x11.cc
+@@ -196,7 +196,7 @@ class OzonePlatformX11 : public OzonePlatform,
+       properties->app_modal_dialogs_use_event_blocker = true;
+       properties->fetch_buffer_formats_for_gmb_on_gpu = true;
+ #if BUILDFLAG(IS_LINUX)
+-      properties->supports_vaapi = true;
++      properties->supports_vaapi_x11 = true;
+ #endif
+ 
+       initialised = true;
+diff --git a/ui/ozone/public/ozone_platform.h b/ui/ozone/public/ozone_platform.h
+index 111259c8dcfc8..1af063158552c 100644
+--- a/ui/ozone/public/ozone_platform.h
++++ b/ui/ozone/public/ozone_platform.h
+@@ -145,12 +145,13 @@ class COMPONENT_EXPORT(OZONE) OzonePlatform {
+     bool fetch_buffer_formats_for_gmb_on_gpu = false;
+ 
+ #if BUILDFLAG(IS_LINUX)
+-    // TODO(crbug.com/1116701): add vaapi support for other Ozone platforms on
+-    // Linux. At the moment, VA-API Linux implementation supports only X11
+-    // backend. This implementation must be refactored to support Ozone
+-    // properly. As a temporary solution, VA-API on Linux checks if vaapi is
+-    // supported (which implicitly means that it is Ozone/X11).
+-    bool supports_vaapi = false;
++    // VA-API supports different display backends.
++    // See https://github.com/intel/libva/blob/master/va/va_backend.h
++    //
++    // VA/DRM and VA/X11 are used by Chromium at the moment. All Ozone platforms
++    // support VA/DRM by default. `supports_vaapi_x11` indicates if VA/X11
++    // supported; it is true only on Ozone/X11 platform.
++    bool supports_vaapi_x11 = false;
+ #endif
+ 
+     // Indicates that the platform allows client applications to manipulate

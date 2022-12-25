@@ -18,7 +18,9 @@
       "patches/chromium/clang-build-script-Support-disabling-the-bundled-libxml2.patch",
       "patches/chromium/Clang-build-script-Don-t-build-against-the-sysroot.patch",
       "patches/chromium/Expose-the-Asahi-GPU-drivers-into-the-sandbox.patch",
-      "patches/chromium/Ignore-useless-warnings-from-the-Asahi-driver.patch"
+      "patches/chromium/Ignore-useless-warnings-from-the-Asahi-driver.patch",
+      "patches/chromium/chromium-qtmlabs.patch",
+      "patches/chromium/chromium-qtmlabs-dawn.patch"
     ]
   }
 ]

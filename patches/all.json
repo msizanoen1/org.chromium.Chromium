@@ -19,6 +19,8 @@
       "patches/chromium/Clang-build-script-Don-t-build-against-the-sysroot.patch",
       "patches/chromium/Expose-the-Asahi-GPU-drivers-into-the-sandbox.patch",
       "patches/chromium/Ignore-useless-warnings-from-the-Asahi-driver.patch",
+      "patches/chromium/chromium-qtmlabs.patch",
+      "patches/chromium/chromium-qtmlabs-dawn.patch",
       "patches/ffmpeg/Enable-support-for-libfdk-aac-and-OpenH264.patch",
       "patches/ffmpeg/ffmpeg-Handle-transient-decode-errors-arising-from-libfdk-.patch",
       "patches/ffmpeg/Add-support-for-cross-compiling-Linux-arm64-x64.patch",

@@ -1,0 +1,23 @@
+diff --git a/third_party/dawn/src/dawn/native/BUILD.gn b/third_party/dawn/src/dawn/native/BUILD.gn
+index 78f95dc56..8c850c08b 100644
+--- a/third_party/dawn/src/dawn/native/BUILD.gn
++++ b/third_party/dawn/src/dawn/native/BUILD.gn
+@@ -678,17 +678,12 @@ source_set("sources") {
+       "vulkan/external_semaphore/SemaphoreService.h",
+     ]
+ 
+-    if (is_chromeos) {
++    if (is_linux || is_chromeos) {
+       sources += [
+         "vulkan/external_memory/MemoryServiceDmaBuf.cpp",
+         "vulkan/external_semaphore/SemaphoreServiceFD.cpp",
+       ]
+       defines += [ "DAWN_USE_SYNC_FDS" ]
+-    } else if (is_linux) {
+-      sources += [
+-        "vulkan/external_memory/MemoryServiceOpaqueFD.cpp",
+-        "vulkan/external_semaphore/SemaphoreServiceFD.cpp",
+-      ]
+     } else if (is_fuchsia) {
+       sources += [
+         "vulkan/external_memory/MemoryServiceZirconHandle.cpp",
